@@ -79,4 +79,32 @@ with tabs[0]:
 
     st.markdown("#### Comparison Chart")
     compare_list = [ticker] + peers
-    prices = price_history(compare_li
+    prices = price_history(compare_list)
+    norm = normalize(prices)
+    fig = px.line(norm.reset_index(), x="Date", y=norm.columns, template="plotly_white")
+    fig.update_layout(height=420, legend_title_text="", margin=dict(l=10, r=10, t=8, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+# -------------------- Stock Tab --------------------
+with tabs[1]:
+    st.markdown(f"#### {ticker} 1-Year Performance")
+    df = price_history([ticker], period="1y")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=df.index, y=df[ticker], mode="lines", name=f"{ticker} Close"))
+    fig2.update_layout(template="plotly_white", height=400, margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(fig2, use_container_width=True)
+
+# -------------------- Headlines Tab --------------------
+with tabs[2]:
+    st.markdown("#### Latest News")
+    news = yf.Ticker(ticker).news
+    if news:
+        for n in news[:8]:
+            st.markdown(f"**[{n['title']}]({n['link']})** — *{n['publisher']}*")
+    else:
+        st.info("No recent headlines found.")
+
+# -------------------- Question Box --------------------
+if send and question.strip():
+    st.sidebar.markdown("**Answer**")
+    st.sidebar.write("This section could later be connected to Gemini/OpenAI for live Q&A.")
