@@ -6,6 +6,10 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+# Defaults for Lockheed Martin view
+DEFAULT_TICKER = "LMT"
+DEFAULT_PEERS = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
+
 # -------------------- Page Config --------------------
 st.set_page_config(page_title="Company Dashboard", page_icon="📈", layout="wide")
 
@@ -56,15 +60,17 @@ def normalize(df):
     return (df / df.iloc[0] * 100).dropna()
 
 # -------------------- Sidebar --------------------
+# --- Sidebar ---
 st.sidebar.subheader("Ticker")
-ticker = st.sidebar.text_input("", value="AAPL").upper().strip()
+ticker = st.sidebar.text_input("", value=DEFAULT_TICKER).upper().strip()
 
 st.sidebar.subheader("Competitors")
-peers = st.sidebar.multiselect("Competitors", ["MSFT", "GOOGL", "AMZN"], default=["MSFT", "GOOGL", "AMZN"], label_visibility="collapsed")
-
-st.sidebar.subheader("Ask a question")
-question = st.sidebar.text_area("Ask a question about this stock", label_visibility="collapsed")
-send = st.sidebar.button("Send", use_container_width=True)
+peers = st.sidebar.multiselect(
+    "Competitors",
+    DEFAULT_PEERS,            # options shown
+    default=DEFAULT_PEERS,    # preselected
+    label_visibility="collapsed"
+)
 
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Financials", "Stock", "Headlines"])
@@ -77,13 +83,37 @@ with tabs[0]:
     with c2: metric_card("P/E Ratio (TTM)", f"{info['pe']:.1f}" if info["pe"] else "—")
     with c3: metric_card("EPS (TTM)", f"{info['eps']:.2f}" if info["eps"] else "—")
 
+        # --- Comparison Chart ---
     st.markdown("#### Comparison Chart")
+
+    # Combine current ticker with selected competitors
     compare_list = [ticker] + peers
-    prices = price_history(compare_list)
-    norm = normalize(prices)
-    fig = px.line(norm.reset_index(), x="Date", y=norm.columns, template="plotly_white")
-    fig.update_layout(height=420, legend_title_text="", margin=dict(l=10, r=10, t=8, b=10))
+
+    # Pull historical price data from yfinance
+    prices = price_history(compare_list, period="3y")
+
+    # Normalize prices (index all at 100 to compare growth)
+    norm = (prices / prices.iloc[0] * 100).dropna()
+
+    # Create interactive line chart
+    fig = px.line(
+        norm.reset_index(),
+        x="Date",
+        y=norm.columns,
+        title="Price Performance (Indexed to 100)",
+        template="plotly_white"
+    )
+
+    fig.update_layout(
+        height=420,
+        legend_title_text="",
+        margin=dict(l=10, r=10, t=40, b=10),
+        yaxis_title="Indexed Price",
+        xaxis_title=None,
+    )
+
     st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------- Stock Tab --------------------
 with tabs[1]:
