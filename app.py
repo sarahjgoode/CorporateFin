@@ -16,6 +16,18 @@ st.markdown("""
 .card {background:#fff;border:1px solid #eee;border-radius:12px;padding:16px 20px;box-shadow:0 1px 2px rgba(0,0,0,0.05);}
 </style>
 """, unsafe_allow_html=True)
+st.markdown("""
+<style>
+.stTabs [data-baseweb="tab"] {
+    color: #333 !important;          /* dark gray text */
+    font-weight: 600 !important;     /* bold labels */
+    font-size: 1rem !important;      /* readable size */
+}
+.stTabs [aria-selected="true"] {
+    color: #000 !important;          /* black for the active tab */
+}
+</style>
+""", unsafe_allow_html=True)
 
 # -------------------- Defaults --------------------
 DEFAULT_TICKER = "LMT"
