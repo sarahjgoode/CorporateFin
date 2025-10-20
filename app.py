@@ -6,12 +6,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-# Defaults for Lockheed Martin view
-DEFAULT_TICKER = "LMT"
-DEFAULT_PEERS = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
-
 # -------------------- Page Config --------------------
-st.set_page_config(page_title="Company Dashboard", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Lockheed Martin Dashboard", page_icon="📈", layout="wide")
 
 st.markdown("""
 <style>
@@ -22,9 +18,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------- Functions --------------------
+# -------------------- Defaults --------------------
+DEFAULT_TICKER = "LMT"
+DEFAULT_PEERS = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
+
+# -------------------- Helper Functions --------------------
 @st.cache_data(ttl=3600)
 def get_info(ticker: str):
+    """Get key financial info for a company."""
     try:
         tk = yf.Ticker(ticker)
         info = tk.info or {}
@@ -38,13 +39,16 @@ def get_info(ticker: str):
 
 @st.cache_data(ttl=3600)
 def price_history(tickers, period="3y"):
+    """Fetch historical price data."""
     df = yf.download(tickers, period=period, interval="1d", auto_adjust=True, progress=False)["Close"]
     if isinstance(df, pd.Series):
         df = df.to_frame(name=tickers)
     return df.dropna(how="all")
 
 def fmt_money(n):
-    if not n: return "—"
+    """Format numbers into human-readable units."""
+    if not n:
+        return "—"
     for unit in ["", "K", "M", "B", "T"]:
         if abs(n) < 1000.0:
             return f"${n:,.0f}{unit}"
@@ -52,30 +56,54 @@ def fmt_money(n):
     return f"${n:,.0f}"
 
 def metric_card(label, value):
-    st.markdown(f'<div class="card"><div style="color:#6b7280;font-size:.9rem;">{label}</div>'
-                f'<div style="font-size:1.8rem;font-weight:700;margin-top:.2rem;">{value}</div></div>',
-                unsafe_allow_html=True)
+    """Styled metric card for displaying key stats."""
+    st.markdown(
+        f'<div class="card"><div style="color:#6b7280;font-size:.9rem;">{label}</div>'
+        f'<div style="font-size:1.8rem;font-weight:700;margin-top:.2rem;">{value}</div></div>',
+        unsafe_allow_html=True
+    )
 
-def normalize(df):
-    return (df / df.iloc[0] * 100).dropna()
+@st.cache_data(ttl=1800)
+def get_news_safe(ticker: str, limit: int = 12):
+    """Fetch news safely without crashing if fields are missing."""
+    try:
+        raw = yf.Ticker(ticker).news or []
+    except Exception:
+        return []
+    rows = []
+    for n in raw[:limit]:
+        title = n.get("title")
+        link = n.get("link")
+        if not title or not link:
+            continue  # skip malformed items
+        publisher = n.get("publisher") or "Source"
+        ts = n.get("providerPublishTime")
+        when = ""
+        if ts:
+            when = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+        rows.append({"title": title, "link": link, "publisher": publisher, "when": when})
+    return rows
 
 # -------------------- Sidebar --------------------
-# --- Sidebar ---
 st.sidebar.subheader("Ticker")
 ticker = st.sidebar.text_input("", value=DEFAULT_TICKER).upper().strip()
 
 st.sidebar.subheader("Competitors")
 peers = st.sidebar.multiselect(
     "Competitors",
-    DEFAULT_PEERS,            # options shown
-    default=DEFAULT_PEERS,    # preselected
+    DEFAULT_PEERS,
+    default=DEFAULT_PEERS,
     label_visibility="collapsed"
 )
+
+st.sidebar.subheader("Ask a question")
+question = st.sidebar.text_area("Ask a question about this stock", label_visibility="collapsed")
+send = st.sidebar.button("Send", use_container_width=True)
 
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Financials", "Stock", "Headlines"])
 
-# -------------------- Financials --------------------
+# -------------------- Financials Tab --------------------
 with tabs[0]:
     info = get_info(ticker)
     c1, c2, c3 = st.columns(3)
@@ -83,19 +111,12 @@ with tabs[0]:
     with c2: metric_card("P/E Ratio (TTM)", f"{info['pe']:.1f}" if info["pe"] else "—")
     with c3: metric_card("EPS (TTM)", f"{info['eps']:.2f}" if info["eps"] else "—")
 
-        # --- Comparison Chart ---
+    # --- Comparison Chart ---
     st.markdown("#### Comparison Chart")
-
-    # Combine current ticker with selected competitors
     compare_list = [ticker] + peers
-
-    # Pull historical price data from yfinance
     prices = price_history(compare_list, period="3y")
-
-    # Normalize prices (index all at 100 to compare growth)
     norm = (prices / prices.iloc[0] * 100).dropna()
 
-    # Create interactive line chart
     fig = px.line(
         norm.reset_index(),
         x="Date",
@@ -103,7 +124,6 @@ with tabs[0]:
         title="Price Performance (Indexed to 100)",
         template="plotly_white"
     )
-
     fig.update_layout(
         height=420,
         legend_title_text="",
@@ -111,9 +131,7 @@ with tabs[0]:
         yaxis_title="Indexed Price",
         xaxis_title=None,
     )
-
     st.plotly_chart(fig, use_container_width=True)
-
 
 # -------------------- Stock Tab --------------------
 with tabs[1]:
@@ -126,13 +144,13 @@ with tabs[1]:
 
 # -------------------- Headlines Tab --------------------
 with tabs[2]:
-    st.markdown("#### Latest News")
-    news = yf.Ticker(ticker).news
-    if news:
-        for n in news[:8]:
-            st.markdown(f"**[{n['title']}]({n['link']})** — *{n['publisher']}*")
+    st.markdown("#### Recent Headlines")
+    news_items = get_news_safe(ticker, limit=12)
+    if not news_items:
+        st.info("No headlines available right now.")
     else:
-        st.info("No recent headlines found.")
+        for n in news_items:
+            st.markdown(f"**[{n['title']}]({n['link']})** — *{n['publisher']}*  {n['when']}")
 
 # -------------------- Question Box --------------------
 if send and question.strip():
