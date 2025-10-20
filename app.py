@@ -1,6 +1,8 @@
+# app.py
 import math
 from datetime import datetime, timezone
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -20,12 +22,11 @@ st.markdown("""
 
 # -------------------- Defaults --------------------
 DEFAULT_TICKER = "LMT"
-DEFAULT_PEERS = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
+DEFAULT_PEERS   = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
 
-# -------------------- Helper Functions --------------------
+# -------------------- Helpers --------------------
 @st.cache_data(ttl=3600)
 def get_info(ticker: str):
-    """Get key financial info for a company."""
     try:
         tk = yf.Ticker(ticker)
         info = tk.info or {}
@@ -37,16 +38,12 @@ def get_info(ticker: str):
     except Exception:
         return {"market_cap": None, "pe": None, "eps": None}
 
-@st.cache_data(ttl=3600)
-def price_history(tickers, period="3y"):
-    """Fetch historical price data."""
-    df = yf.download(tickers, period=period, interval="1d", auto_adjust=True, progress=False)["Close"]
-    if isinstance(df, pd.Series):
-        df = df.to_frame(name=tickers)
-    return df.dropna(how="all")
+@st.cache_data(ttl=3600, show_spinner=False)
+def price_history(tickers, period="3y", interval="1d"):
+    data = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
+    return data  # may contain ['Open','High','Low','Close','Adj Close','Volume']
 
 def fmt_money(n):
-    """Format numbers into human-readable units."""
     if not n:
         return "—"
     for unit in ["", "K", "M", "B", "T"]:
@@ -56,16 +53,22 @@ def fmt_money(n):
     return f"${n:,.0f}"
 
 def metric_card(label, value):
-    """Styled metric card for displaying key stats."""
     st.markdown(
         f'<div class="card"><div style="color:#6b7280;font-size:.9rem;">{label}</div>'
         f'<div style="font-size:1.8rem;font-weight:700;margin-top:.2rem;">{value}</div></div>',
         unsafe_allow_html=True
     )
 
+def normalize(close_df: pd.DataFrame) -> pd.DataFrame:
+    return (close_df / close_df.iloc[0] * 100).dropna()
+
+def compute_drawdown(close: pd.Series) -> pd.Series:
+    cummax = close.cummax()
+    dd = (close / cummax - 1.0) * 100.0
+    return dd
+
 @st.cache_data(ttl=1800)
 def get_news_safe(ticker: str, limit: int = 12):
-    """Fetch news safely without crashing if fields are missing."""
     try:
         raw = yf.Ticker(ticker).news or []
     except Exception:
@@ -75,7 +78,7 @@ def get_news_safe(ticker: str, limit: int = 12):
         title = n.get("title")
         link = n.get("link")
         if not title or not link:
-            continue  # skip malformed items
+            continue
         publisher = n.get("publisher") or "Source"
         ts = n.get("providerPublishTime")
         when = ""
@@ -111,11 +114,12 @@ with tabs[0]:
     with c2: metric_card("P/E Ratio (TTM)", f"{info['pe']:.1f}" if info["pe"] else "—")
     with c3: metric_card("EPS (TTM)", f"{info['eps']:.2f}" if info["eps"] else "—")
 
-    # --- Comparison Chart ---
+    # --- Comparison Chart (Indexed to 100) ---
     st.markdown("#### Comparison Chart")
     compare_list = [ticker] + peers
     prices = price_history(compare_list, period="3y")
-    norm = (prices / prices.iloc[0] * 100).dropna()
+    close = prices["Close"]
+    norm = normalize(close)
 
     fig = px.line(
         norm.reset_index(),
@@ -135,12 +139,89 @@ with tabs[0]:
 
 # -------------------- Stock Tab --------------------
 with tabs[1]:
-    st.markdown(f"#### {ticker} 1-Year Performance")
-    df = price_history([ticker], period="1y")
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=df.index, y=df[ticker], mode="lines", name=f"{ticker} Close"))
-    fig2.update_layout(template="plotly_white", height=400, margin=dict(l=10, r=10, t=20, b=10))
-    st.plotly_chart(fig2, use_container_width=True)
+    st.markdown(f"### {ticker} Analytics")
+    sub1, sub2, sub3, sub4, sub5 = st.tabs(["Price (1Y)", "Candlestick + Volume", "Drawdown", "Rolling Metrics", "Peer Performance"])
+
+    # Pull all data once (3y for analytics; 1y for price)
+    data_3y = price_history([ticker], period="3y")
+    data_1y = price_history([ticker], period="1y")
+
+    # ----- Price (1Y) -----
+    with sub1:
+        close_1y = data_1y["Close"][ticker]
+        ma50  = close_1y.rolling(50).mean()
+        ma200 = close_1y.rolling(200).mean()
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=close_1y.index, y=close_1y, mode="lines", name=f"{ticker} Close"))
+        fig2.add_trace(go.Scatter(x=ma50.index,  y=ma50,  mode="lines", name="50-day MA"))
+        fig2.add_trace(go.Scatter(x=ma200.index, y=ma200, mode="lines", name="200-day MA"))
+        fig2.update_layout(template="plotly_white", height=420, margin=dict(l=10, r=10, t=20, b=10),
+                           xaxis_title=None, yaxis_title="Price")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ----- Candlestick + Volume -----
+    with sub2:
+        ohlc = data_1y[["Open","High","Low","Close"]][ticker]
+        vol  = data_1y["Volume"][ticker]
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Candlestick(
+            x=ohlc.index,
+            open=ohlc["Open"], high=ohlc["High"], low=ohlc["Low"], close=ohlc["Close"],
+            name="OHLC"
+        ))
+        fig3.add_trace(go.Bar(x=vol.index, y=vol, name="Volume", yaxis="y2", opacity=0.3))
+        fig3.update_layout(
+            template="plotly_white",
+            height=520,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title=None,
+            yaxis_title="Price",
+            yaxis2=dict(overlaying="y", side="right", showgrid=False, title="Volume")
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # ----- Drawdown -----
+    with sub3:
+        close_3y = data_3y["Close"][ticker]
+        dd = compute_drawdown(close_3y)
+        fig4 = px.area(dd, x=dd.index, y=dd.values, template="plotly_white",
+                       labels={"x":"Date","y":"Drawdown (%)"}, title="Peak-to-Trough Drawdown (3Y)")
+        fig4.update_traces(hovertemplate="Drawdown: %{y:.2f}%<extra></extra>")
+        fig4.update_layout(height=380, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig4, use_container_width=True)
+
+    # ----- Rolling Metrics -----
+    with sub4:
+        close_3y = data_3y["Close"][ticker]
+        ret = close_3y.pct_change()
+        roll_vol = (ret.rolling(20).std() * np.sqrt(252)) * 100  # annualized %
+        roll_ret = (close_3y / close_3y.shift(60) - 1) * 100     # ~3 months
+
+        cA, cB = st.columns(2)
+        with cA:
+            fig5 = px.line(roll_vol, x=roll_vol.index, y=roll_vol.values, template="plotly_white",
+                           labels={"x":"Date","y":"Volatility (%)"}, title="Rolling 20D Annualized Volatility")
+            fig5.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig5, use_container_width=True)
+        with cB:
+            fig6 = px.line(roll_ret, x=roll_ret.index, y=roll_ret.values, template="plotly_white",
+                           labels={"x":"Date","y":"Return (%)"}, title="Rolling 60D Return")
+            fig6.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig6, use_container_width=True)
+
+    # ----- Peer Performance (YTD) -----
+    with sub5:
+        compare_list = [ticker] + peers
+        ytd = price_history(compare_list, period="ytd")["Close"]
+        perf = ((ytd.iloc[-1] / ytd.iloc[0] - 1) * 100).round(2).sort_values(ascending=False)
+        fig7 = px.bar(perf, x=perf.index, y=perf.values, text=perf.values,
+                      template="plotly_white", labels={"x":"Ticker","y":"YTD %"},
+                      title="YTD Performance vs Peers")
+        fig7.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+        fig7.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10), yaxis_ticksuffix="%")
+        st.plotly_chart(fig7, use_container_width=True)
 
 # -------------------- Headlines Tab --------------------
 with tabs[2]:
@@ -152,7 +233,7 @@ with tabs[2]:
         for n in news_items:
             st.markdown(f"**[{n['title']}]({n['link']})** — *{n['publisher']}*  {n['when']}")
 
-# -------------------- Question Box --------------------
+# -------------------- Question Box (placeholder) --------------------
 if send and question.strip():
     st.sidebar.markdown("**Answer**")
-    st.sidebar.write("This section could later be connected to Gemini/OpenAI for live Q&A.")
+    st.sidebar.write("Quick Q&A placeholder — we can wire this to an LLM later.")
