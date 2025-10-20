@@ -1,35 +1,48 @@
 # app.py
 import math
 from datetime import datetime, timezone
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-# -------------------- Page Config --------------------
+# -------------------- Page Config & Light Styles --------------------
 st.set_page_config(page_title="Lockheed Martin Dashboard", page_icon="📈", layout="wide")
-
 st.markdown("""
 <style>
 .block-container {padding-top: 1rem; padding-bottom: 2rem;}
 .card {background:#fff;border:1px solid #eee;border-radius:12px;padding:16px 20px;box-shadow:0 1px 2px rgba(0,0,0,0.05);}
-.legend-row {display:flex;gap:1.25rem;align-items:center;margin-top:.5rem;}
-.legend-dot {width:10px;height:10px;border-radius:999px;display:inline-block;}
 </style>
 """, unsafe_allow_html=True)
 
 # -------------------- Defaults --------------------
 DEFAULT_TICKER = "LMT"
-DEFAULT_PEERS   = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
+DEFAULT_PEERS  = ["NOC", "RTX", "GD", "BA"]  # Northrop, Raytheon, General Dynamics, Boeing
 
 # -------------------- Helpers --------------------
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
+def price_history(tickers, period="3y", interval="1d"):
+    """
+    Wrap yfinance download and normalize columns:
+    - Multiple tickers -> MultiIndex columns (['Open','High','Low','Close','Volume'], ticker)
+      Access like data['Close'] -> DataFrame of closes by ticker.
+    - Single ticker    -> drop ticker level so columns are simple: Open, High, Low, Close, Volume
+    """
+    data = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
+
+    # If user passed a single ticker as a list/tuple, drop the ticker level for single-level columns
+    if isinstance(tickers, (list, tuple, set)) and len(tickers) == 1:
+        if isinstance(data.columns, pd.MultiIndex) and data.columns.nlevels == 2:
+            data = data.droplevel(1, axis=1)
+
+    return data
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_info(ticker: str):
     try:
-        tk = yf.Ticker(ticker)
-        info = tk.info or {}
+        info = yf.Ticker(ticker).info or {}
         return {
             "market_cap": info.get("marketCap"),
             "pe": info.get("trailingPE"),
@@ -37,11 +50,6 @@ def get_info(ticker: str):
         }
     except Exception:
         return {"market_cap": None, "pe": None, "eps": None}
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def price_history(tickers, period="3y", interval="1d"):
-    data = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
-    return data  # may contain ['Open','High','Low','Close','Adj Close','Volume']
 
 def fmt_money(n):
     if not n:
@@ -63,12 +71,12 @@ def normalize(close_df: pd.DataFrame) -> pd.DataFrame:
     return (close_df / close_df.iloc[0] * 100).dropna()
 
 def compute_drawdown(close: pd.Series) -> pd.Series:
-    cummax = close.cummax()
-    dd = (close / cummax - 1.0) * 100.0
-    return dd
+    peak = close.cummax()
+    return (close / peak - 1.0) * 100.0
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_news_safe(ticker: str, limit: int = 12):
+    """Fetch news and skip malformed items to avoid KeyErrors."""
     try:
         raw = yf.Ticker(ticker).news or []
     except Exception:
@@ -92,12 +100,7 @@ st.sidebar.subheader("Ticker")
 ticker = st.sidebar.text_input("", value=DEFAULT_TICKER).upper().strip()
 
 st.sidebar.subheader("Competitors")
-peers = st.sidebar.multiselect(
-    "Competitors",
-    DEFAULT_PEERS,
-    default=DEFAULT_PEERS,
-    label_visibility="collapsed"
-)
+peers = st.sidebar.multiselect("Competitors", DEFAULT_PEERS, default=DEFAULT_PEERS, label_visibility="collapsed")
 
 st.sidebar.subheader("Ask a question")
 question = st.sidebar.text_area("Ask a question about this stock", label_visibility="collapsed")
@@ -114,41 +117,33 @@ with tabs[0]:
     with c2: metric_card("P/E Ratio (TTM)", f"{info['pe']:.1f}" if info["pe"] else "—")
     with c3: metric_card("EPS (TTM)", f"{info['eps']:.2f}" if info["eps"] else "—")
 
-    # --- Comparison Chart (Indexed to 100) ---
+    # Comparison chart (Indexed to 100) for LMT + peers (3Y)
     st.markdown("#### Comparison Chart")
     compare_list = [ticker] + peers
     prices = price_history(compare_list, period="3y")
-    close = prices["Close"]
-    norm = normalize(close)
+    # With multiple tickers, prices["Close"] returns a DataFrame of closes by ticker (single-level columns)
+    close_df = prices["Close"] if "Close" in prices else prices
+    norm = normalize(close_df)
 
-    fig = px.line(
-        norm.reset_index(),
-        x="Date",
-        y=norm.columns,
-        title="Price Performance (Indexed to 100)",
-        template="plotly_white"
-    )
-    fig.update_layout(
-        height=420,
-        legend_title_text="",
-        margin=dict(l=10, r=10, t=40, b=10),
-        yaxis_title="Indexed Price",
-        xaxis_title=None,
-    )
+    fig = px.line(norm.reset_index(), x="Date", y=norm.columns,
+                  title="Price Performance (Indexed to 100)", template="plotly_white")
+    fig.update_layout(height=420, legend_title_text="", margin=dict(l=10, r=10, t=40, b=10),
+                      yaxis_title="Indexed Price", xaxis_title=None)
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- Stock Tab --------------------
+# -------------------- Stock Tab (sub-tabs) --------------------
 with tabs[1]:
     st.markdown(f"### {ticker} Analytics")
-    sub1, sub2, sub3, sub4, sub5 = st.tabs(["Price (1Y)", "Candlestick + Volume", "Drawdown", "Rolling Metrics", "Peer Performance"])
+    sub1, sub2, sub3, sub4, sub5 = st.tabs(
+        ["Price (1Y)", "Candlestick + Volume", "Drawdown", "Rolling Metrics", "Peer Performance"]
+    )
 
-    # Pull all data once (3y for analytics; 1y for price)
-    data_3y = price_history([ticker], period="3y")
+    data_3y = price_history([ticker], period="3y")  # single ticker -> single-level columns
     data_1y = price_history([ticker], period="1y")
 
     # ----- Price (1Y) -----
     with sub1:
-        close_1y = data_1y["Close"][ticker]
+        close_1y = data_1y["Close"]
         ma50  = close_1y.rolling(50).mean()
         ma200 = close_1y.rolling(200).mean()
 
@@ -162,8 +157,15 @@ with tabs[1]:
 
     # ----- Candlestick + Volume -----
     with sub2:
-        ohlc = data_1y[["Open","High","Low","Close"]][ticker]
-        vol  = data_1y["Volume"][ticker]
+        # Robust selection regardless of yfinance quirks (already single-level, but keep guard)
+        if isinstance(data_1y.columns, pd.MultiIndex):
+            ohlc = data_1y.xs(["Open","High","Low","Close"], axis=1, level=0)
+            ohlc = ohlc.droplevel(1, axis=1)  # drop ticker level
+            ohlc = ohlc[["Open","High","Low","Close"]]
+            vol  = data_1y.xs("Volume", axis=1, level=0).squeeze()
+        else:
+            ohlc = data_1y[["Open","High","Low","Close"]]
+            vol  = data_1y["Volume"]
 
         fig3 = go.Figure()
         fig3.add_trace(go.Candlestick(
@@ -182,9 +184,9 @@ with tabs[1]:
         )
         st.plotly_chart(fig3, use_container_width=True)
 
-    # ----- Drawdown -----
+    # ----- Drawdown (3Y) -----
     with sub3:
-        close_3y = data_3y["Close"][ticker]
+        close_3y = data_3y["Close"]
         dd = compute_drawdown(close_3y)
         fig4 = px.area(dd, x=dd.index, y=dd.values, template="plotly_white",
                        labels={"x":"Date","y":"Drawdown (%)"}, title="Peak-to-Trough Drawdown (3Y)")
@@ -194,7 +196,7 @@ with tabs[1]:
 
     # ----- Rolling Metrics -----
     with sub4:
-        close_3y = data_3y["Close"][ticker]
+        close_3y = data_3y["Close"]
         ret = close_3y.pct_change()
         roll_vol = (ret.rolling(20).std() * np.sqrt(252)) * 100  # annualized %
         roll_ret = (close_3y / close_3y.shift(60) - 1) * 100     # ~3 months
@@ -213,9 +215,10 @@ with tabs[1]:
 
     # ----- Peer Performance (YTD) -----
     with sub5:
-        compare_list = [ticker] + peers
-        ytd = price_history(compare_list, period="ytd")["Close"]
-        perf = ((ytd.iloc[-1] / ytd.iloc[0] - 1) * 100).round(2).sort_values(ascending=False)
+        compare = [ticker] + peers
+        ytd = price_history(compare, period="ytd")
+        ytd_close = ytd["Close"] if "Close" in ytd else ytd
+        perf = ((ytd_close.iloc[-1] / ytd_close.iloc[0] - 1) * 100).round(2).sort_values(ascending=False)
         fig7 = px.bar(perf, x=perf.index, y=perf.values, text=perf.values,
                       template="plotly_white", labels={"x":"Ticker","y":"YTD %"},
                       title="YTD Performance vs Peers")
@@ -233,7 +236,7 @@ with tabs[2]:
         for n in news_items:
             st.markdown(f"**[{n['title']}]({n['link']})** — *{n['publisher']}*  {n['when']}")
 
-# -------------------- Question Box (placeholder) --------------------
+# -------------------- Sidebar Q&A (placeholder) --------------------
 if send and question.strip():
     st.sidebar.markdown("**Answer**")
     st.sidebar.write("Quick Q&A placeholder — we can wire this to an LLM later.")
