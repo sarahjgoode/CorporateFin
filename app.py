@@ -243,7 +243,6 @@ with tabs[0]:
 # -------------------- LMT Analytics --------------------
 with tabs[1]:
     st.markdown("# 📊 LMT Analytics")
-    st.info("**OHLC** = **O**pen, **H**igh, **L**ow, **C**lose — the daily trading range of the stock.")
     sub1, sub2, sub3, sub4, sub5 = st.tabs(
         ["Price (1Y)", "Candlestick + Volume", "Drawdown", "Rolling Metrics", "Peer Performance"]
     )
