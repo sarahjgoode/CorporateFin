@@ -1,17 +1,15 @@
- # app.py
-import math
-from datetime import datetime, timezone
+# app.py
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from datetime import datetime, timezone
+from typing import Optional, List, Dict
 
-# -------------------- Page Config --------------------
+# -------------------- Page Config & Styling --------------------
 st.set_page_config(page_title="Lockheed Martin Dashboard", page_icon="📈", layout="wide")
-
-# Minimal styling + tab label visibility helpers
 st.markdown("""
 <style>
 .block-container {padding-top: 1rem; padding-bottom: 2rem;}
@@ -25,9 +23,10 @@ st.markdown("""
 DEFAULT_TICKER = "LMT"
 DEFAULT_PEERS  = ["NOC", "RTX", "GD", "BA"]
 
-# -------------------- Helpers --------------------
+# -------------------- Generic Helpers --------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def price_history(tickers, period="3y", interval="1d"):
+    """Download price data and flatten single-ticker MultiIndex columns."""
     data = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(tickers, (list, tuple, set)) and len(tickers) == 1:
         if isinstance(data.columns, pd.MultiIndex) and data.columns.nlevels == 2:
@@ -35,7 +34,7 @@ def price_history(tickers, period="3y", interval="1d"):
     return data
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_info(ticker: str):
+def get_info(ticker: str) -> Dict[str, Optional[float]]:
     try:
         info = yf.Ticker(ticker).info or {}
         return {
@@ -46,16 +45,15 @@ def get_info(ticker: str):
     except Exception:
         return {"market_cap": None, "pe": None, "eps": None}
 
-def fmt_money(n):
-    if not n:
-        return "—"
+def fmt_money(n: Optional[float]) -> str:
+    if n is None or pd.isna(n): return "—"
     for unit in ["", "K", "M", "B", "T"]:
         if abs(n) < 1000.0:
             return f"${n:,.0f}{unit}"
         n /= 1000.0
     return f"${n:,.0f}"
 
-def metric_card(label, value):
+def metric_card(label: str, value: str):
     st.markdown(
         f'<div class="card"><div style="color:#6b7280;font-size:.9rem;">{label}</div>'
         f'<div style="font-size:1.8rem;font-weight:700;margin-top:.2rem;">{value}</div></div>',
@@ -69,16 +67,14 @@ def compute_drawdown(close: pd.Series) -> pd.Series:
     peak = close.cummax()
     return (close / peak - 1.0) * 100.0
 
-# -------- Fundamentals (quarterly) helpers --------
+# -------------------- Fundamentals: fetch & compute --------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_quarterly_frames(ticker: str):
     """
     Fetch quarterly financials/balance sheet/cashflow.
     Return tidy DataFrames with datetime index ascending.
-    Never truth-test DataFrames; normalize None/empty to empty DFs.
     """
     t = yf.Ticker(ticker)
-
     fin = t.quarterly_financials
     bs  = t.quarterly_balance_sheet
     cf  = t.quarterly_cashflow
@@ -86,55 +82,27 @@ def get_quarterly_frames(ticker: str):
     def _norm(df):
         if not isinstance(df, pd.DataFrame) or df.empty:
             return pd.DataFrame()
-        df = df.T.copy()
-        # yfinance uses period labels; coerce to datetime (NaT ok)
+        out = df.T.copy()
         try:
-            df.index = pd.to_datetime(df.index)
+            out.index = pd.to_datetime(out.index)
         except Exception:
             pass
-        df.sort_index(inplace=True)
-        return df
+        out.sort_index(inplace=True)
+        return out
 
-    fin = _norm(fin)
-    bs  = _norm(bs)
-    cf  = _norm(cf)
-    return fin, bs, cf
+    return _norm(fin), _norm(bs), _norm(cf)
 
-
-def series_or_none(df: pd.DataFrame, col: str):
-    return df[col] if (not df.empty and col in df.columns) else None
-
-def avg_of_series(s: pd.Series, window: int = 2):
-    """Rolling average to approximate average balance sheet values between periods."""
-    return s.rolling(window).mean()
-
-def ratio_line(y, title, y_is_pct=True):
-    """Plot a single-line series with sensible formatting."""
-    if y is None or y.dropna().empty:
-        st.info("Not enough data to display this metric.")
-        return
-    label_y = "Value (%)" if y_is_pct else "Value"
-    fig = px.line(y, x=y.index, y=y.values, template="plotly_white",
-                  labels={"x":"Date", "y":label_y}, title=title)
-    if y_is_pct:
-        fig.update_layout(yaxis_ticksuffix="%")
-    fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-def pick_col(df: pd.DataFrame, *candidates: str) -> pd.Series | None:
-    """Return the first existing column as a Series (or None)."""
+def pick_col(df: pd.DataFrame, *candidates: str) -> Optional[pd.Series]:
+    """Return the first existing column as a numeric Series (or None)."""
     if df is None or df.empty:
         return None
     for name in candidates:
         if name in df.columns:
-            s = df[name].copy()
-            # numeric if possible
-            with pd.option_context("future.no_silent_downcasting", True):
-                s = pd.to_numeric(s, errors="coerce")
+            s = pd.to_numeric(df[name], errors="coerce")
             return s
     return None
 
-def align(*series: pd.Series) -> list[pd.Series]:
+def align_series(*series: Optional[pd.Series]) -> List[Optional[pd.Series]]:
     """Align multiple series to their common index (inner join)."""
     idx = None
     for s in series:
@@ -148,21 +116,19 @@ def align(*series: pd.Series) -> list[pd.Series]:
             out.append(s.reindex(idx))
     return out
 
-def safe_ratio(numer: pd.Series | None, denom: pd.Series | None, pct: bool = True) -> pd.Series | None:
+def safe_ratio(numer: Optional[pd.Series], denom: Optional[pd.Series], pct: bool = True) -> Optional[pd.Series]:
     if numer is None or denom is None:
         return None
-    n, d = align(numer, denom)
+    n, d = align_series(numer, denom)
     if n is None or d is None:
         return None
-    d = d.replace(0, np.nan)  # avoid divide-by-zero
+    d = d.replace(0, np.nan)
     r = n / d
-    if pct:
-        r = r * 100.0
+    if pct: r = r * 100.0
     return r.dropna(how="all")
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def compute_fundamental_series(ticker: str):
+def compute_fundamental_series(ticker: str) -> Dict[str, Optional[pd.Series]]:
     fin, bs, cf = get_quarterly_frames(ticker)
 
     # Income statement
@@ -170,17 +136,14 @@ def compute_fundamental_series(ticker: str):
     net_income   = pick_col(fin, "Net Income")
     gross_profit = pick_col(fin, "Gross Profit")
 
-    # Balance sheet (use multiple common name variants)
-    equity = (
-        pick_col(bs,
-                 "Stockholders Equity",
-                 "Total Stockholder Equity",
-                 "Total Stockholders Equity",
-                 "Total Equity Gross Minority Interest")
+    # Balance sheet
+    equity = pick_col(bs,
+        "Stockholders Equity",
+        "Total Stockholder Equity",
+        "Total Stockholders Equity",
+        "Total Equity Gross Minority Interest"
     )
     total_assets = pick_col(bs, "Total Assets")
-    curr_assets  = pick_col(bs, "Total Current Assets")
-    curr_liab    = pick_col(bs, "Total Current Liabilities")
 
     total_debt = pick_col(bs, "Total Debt", "Net Debt")
     if total_debt is None:
@@ -194,37 +157,53 @@ def compute_fundamental_series(ticker: str):
     # Cash flow
     op_cf = pick_col(cf, "Operating Cash Flow", "Total Cash From Operating Activities")
     capex = pick_col(cf, "Capital Expenditure", "Capital Expenditures")
-    fcf   = None
-    if op_cf is not None and capex is not None:
-        # CapEx is negative in yfinance; FCF = CFO - CapEx = CFO + (negative CapEx)
-        fcf = op_cf + capex
+    fcf   = (op_cf + capex) if (op_cf is not None and capex is not None) else None  # CapEx negative in yfinance
 
-    # Averages for ROE/ROA (2-period rolling mean)
+    # Averages for ROE/ROA
     equity_avg = equity.rolling(2).mean() if equity is not None else None
     assets_avg = total_assets.rolling(2).mean() if total_assets is not None else None
 
-    # Ratios
-    roe          = safe_ratio(net_income, equity_avg, pct=True)     # %
-    current_ratio= safe_ratio(curr_assets, curr_liab, pct=False)    # x
-    net_margin   = safe_ratio(net_income, revenue, pct=True)        # %
-    roa          = safe_ratio(net_income, assets_avg, pct=True)     # %
-    de_ratio     = safe_ratio(total_debt, equity, pct=False)        # x
-    fcf_margin   = safe_ratio(fcf, revenue, pct=True)               # %
-    gross_margin = safe_ratio(gross_profit, revenue, pct=True)      # %
-
-    def trim(s):  # last ~20 quarters
-        return s.tail(20) if s is not None else None
+    # Ratios (trim to last ~20 quarters)
+    def trim(s): return s.tail(20) if s is not None else None
 
     return {
-        "roe": trim(roe),
-        "current_ratio": trim(current_ratio),
-        "net_margin": trim(net_margin),
-        "roa": trim(roa),
-        "de_ratio": trim(de_ratio),
-        "fcf_margin": trim(fcf_margin),
-        "gross_margin": trim(gross_margin),
+        "roe":          trim(safe_ratio(net_income, equity_avg,  pct=True)),   # %
+        "net_margin":   trim(safe_ratio(net_income, revenue,     pct=True)),   # %
+        "roa":          trim(safe_ratio(net_income, assets_avg,  pct=True)),   # %
+        "de_ratio":     trim(safe_ratio(total_debt, equity,      pct=False)),  # x
+        "fcf_margin":   trim(safe_ratio(fcf,        revenue,     pct=True)),   # %
+        "gross_margin": trim(safe_ratio(gross_profit, revenue,   pct=True)),   # %
     }
 
+def plot_metric_across_tickers(tickers: List[str], metric_key: str, title: str, pct: bool = True):
+    """
+    Collect the given fundamentals metric for each ticker, align on common dates,
+    and render a multi-line Plotly chart.
+    """
+    series_map: Dict[str, pd.Series] = {}
+    for sym in tickers:
+        data = compute_fundamental_series(sym)
+        s = data.get(metric_key)
+        if s is not None and not s.dropna().empty:
+            series_map[sym] = s
+
+    if not series_map:
+        st.info("Not enough data available for this metric.")
+        return
+
+    df = pd.concat(series_map, axis=1)  # columns per ticker
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna(how="all")
+
+    fig = px.line(
+        df, x=df.index, y=df.columns, template="plotly_white",
+        title=title, labels={"value": "Value (%)" if pct else "Value", "variable": "Ticker", "index": "Date"}
+    )
+    if pct:
+        fig.update_layout(yaxis_ticksuffix="%")
+    fig.update_layout(height=380, margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
+    st.plotly_chart(fig, use_container_width=True)
 
 # -------------------- Sidebar --------------------
 st.sidebar.subheader("Ticker")
@@ -249,13 +228,12 @@ with tabs[0]:
     with c2: metric_card("P/E Ratio (TTM)", f"{info['pe']:.1f}" if info["pe"] else "—")
     with c3: metric_card("EPS (TTM)", f"{info['eps']:.2f}" if info["eps"] else "—")
 
-    # Comparison chart (3Y, indexed to 100)
+    # 3Y Indexed comparison chart
     st.markdown("### 📊 Comparison Chart — LMT vs Competitors")
     compare_list = [ticker] + peers
     prices = price_history(compare_list, period="3y")
     close_df = prices["Close"] if "Close" in prices else prices
     norm = normalize(close_df)
-
     fig = px.line(norm.reset_index(), x="Date", y=norm.columns,
                   title="Price Performance (Indexed to 100)", template="plotly_white")
     fig.update_layout(height=420, legend_title_text="", margin=dict(l=10, r=10, t=40, b=10),
@@ -266,7 +244,6 @@ with tabs[0]:
 with tabs[1]:
     st.markdown("# 📊 LMT Analytics")
     st.info("**OHLC** = **O**pen, **H**igh, **L**ow, **C**lose — the daily trading range of the stock.")
-
     sub1, sub2, sub3, sub4, sub5 = st.tabs(
         ["Price (1Y)", "Candlestick + Volume", "Drawdown", "Rolling Metrics", "Peer Performance"]
     )
@@ -294,21 +271,17 @@ with tabs[1]:
         fig3 = go.Figure()
         fig3.add_trace(go.Candlestick(
             x=ohlc.index,
-            open=ohlc["Open"], high=ohlc["High"], low=ohlc["Low"], close=ohlc["Close"],
-            name="OHLC"
+            open=ohlc["Open"], high=ohlc["High"], low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
         ))
         fig3.add_trace(go.Bar(x=vol.index, y=vol, name="Volume", yaxis="y2", opacity=0.3))
         fig3.update_layout(
-            template="plotly_white",
-            height=520,
-            margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_title=None,
-            yaxis_title="Price",
+            template="plotly_white", height=520, margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title=None, yaxis_title="Price",
             yaxis2=dict(overlaying="y", side="right", showgrid=False, title="Volume")
         )
         st.plotly_chart(fig3, use_container_width=True)
 
-    # Drawdown
+    # Drawdown (3Y)
     with sub3:
         close_3y = data_3y["Close"]
         dd = compute_drawdown(close_3y)
@@ -352,19 +325,32 @@ with tabs[1]:
 # -------------------- Fundamentals (Ratios) --------------------
 with tabs[2]:
     st.markdown("# 📑 Fundamentals (Quarterly Ratios)")
-    ratios = compute_fundamental_series(ticker)
 
-    s1, s2, s3, s4, s5, s6, s7 = st.tabs(
-        ["ROE", "Current Ratio", "Net Profit Margin", "ROA", "Debt-to-Equity", "FCF Margin", "Gross Profit Margin"]
+    # Toggle to include peers on charts
+    show_peers = st.checkbox("Show peers on charts", value=True)
+    symbols = [ticker] + (peers if show_peers else [])
+
+    s1, s2, s3, s4, s5, s6 = st.tabs(
+        ["ROE", "Net Profit Margin", "ROA", "Debt-to-Equity", "FCF Margin", "Gross Profit Margin"]
     )
 
-    with s1: ratio_line(ratios["roe"], "Return on Equity (ROE)", y_is_pct=True)
-    with s2: ratio_line(ratios["current_ratio"], "Current Ratio", y_is_pct=False)
-    with s3: ratio_line(ratios["net_margin"], "Net Profit Margin", y_is_pct=True)
-    with s4: ratio_line(ratios["roa"], "Return on Assets (ROA)", y_is_pct=True)
-    with s5: ratio_line(ratios["de_ratio"], "Debt-to-Equity (x)", y_is_pct=False)
-    with s6: ratio_line(ratios["fcf_margin"], "Free Cash Flow Margin", y_is_pct=True)
-    with s7: ratio_line(ratios["gross_margin"], "Gross Profit Margin", y_is_pct=True)
+    with s1:
+        plot_metric_across_tickers(symbols, "roe", "Return on Equity (ROE)", pct=True)
+
+    with s2:
+        plot_metric_across_tickers(symbols, "net_margin", "Net Profit Margin", pct=True)
+
+    with s3:
+        plot_metric_across_tickers(symbols, "roa", "Return on Assets (ROA)", pct=True)
+
+    with s4:
+        plot_metric_across_tickers(symbols, "de_ratio", "Debt-to-Equity (x)", pct=False)
+
+    with s5:
+        plot_metric_across_tickers(symbols, "fcf_margin", "Free Cash Flow Margin", pct=True)
+
+    with s6:
+        plot_metric_across_tickers(symbols, "gross_margin", "Gross Profit Margin", pct=True)
 
 # -------------------- Sidebar Q&A (placeholder) --------------------
 if send and question.strip():
