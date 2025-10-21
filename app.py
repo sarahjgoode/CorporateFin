@@ -72,21 +72,34 @@ def compute_drawdown(close: pd.Series) -> pd.Series:
 # -------- Fundamentals (quarterly) helpers --------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_quarterly_frames(ticker: str):
-    """Fetch quarterly financial statements required for ratios."""
+    """
+    Fetch quarterly financials/balance sheet/cashflow.
+    Return tidy DataFrames with datetime index ascending.
+    Never truth-test DataFrames; normalize None/empty to empty DFs.
+    """
     t = yf.Ticker(ticker)
-    fin  = t.quarterly_financials or pd.DataFrame()       # rows: line items; cols: periods
-    bs   = t.quarterly_balance_sheet or pd.DataFrame()
-    cf   = t.quarterly_cashflow or pd.DataFrame()
-    # Transpose so index = period datetime, columns = items
-    if not fin.empty: fin = fin.T
-    if not bs.empty:  bs  = bs.T
-    if not cf.empty:  cf  = cf.T
-    # Ensure datetime index sorted ascending
-    for df in (fin, bs, cf):
-        if not df.empty:
+
+    fin = t.quarterly_financials
+    bs  = t.quarterly_balance_sheet
+    cf  = t.quarterly_cashflow
+
+    def _norm(df):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        df = df.T.copy()
+        # yfinance uses period labels; coerce to datetime (NaT ok)
+        try:
             df.index = pd.to_datetime(df.index)
-            df.sort_index(inplace=True)
+        except Exception:
+            pass
+        df.sort_index(inplace=True)
+        return df
+
+    fin = _norm(fin)
+    bs  = _norm(bs)
+    cf  = _norm(cf)
     return fin, bs, cf
+
 
 def series_or_none(df: pd.DataFrame, col: str):
     return df[col] if (not df.empty and col in df.columns) else None
@@ -108,49 +121,98 @@ def ratio_line(y, title, y_is_pct=True):
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
+def pick_col(df: pd.DataFrame, *candidates: str) -> pd.Series | None:
+    """Return the first existing column as a Series (or None)."""
+    if df is None or df.empty:
+        return None
+    for name in candidates:
+        if name in df.columns:
+            s = df[name].copy()
+            # numeric if possible
+            with pd.option_context("future.no_silent_downcasting", True):
+                s = pd.to_numeric(s, errors="coerce")
+            return s
+    return None
+
+def align(*series: pd.Series) -> list[pd.Series]:
+    """Align multiple series to their common index (inner join)."""
+    idx = None
+    for s in series:
+        if s is not None and not s.dropna().empty:
+            idx = s.index if idx is None else idx.intersection(s.index)
+    out = []
+    for s in series:
+        if s is None or idx is None:
+            out.append(None)
+        else:
+            out.append(s.reindex(idx))
+    return out
+
+def safe_ratio(numer: pd.Series | None, denom: pd.Series | None, pct: bool = True) -> pd.Series | None:
+    if numer is None or denom is None:
+        return None
+    n, d = align(numer, denom)
+    if n is None or d is None:
+        return None
+    d = d.replace(0, np.nan)  # avoid divide-by-zero
+    r = n / d
+    if pct:
+        r = r * 100.0
+    return r.dropna(how="all")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def compute_fundamental_series(ticker: str):
     fin, bs, cf = get_quarterly_frames(ticker)
 
-    revenue      = series_or_none(fin, "Total Revenue")
-    net_income   = series_or_none(fin, "Net Income")
-    gross_profit = series_or_none(fin, "Gross Profit")
+    # Income statement
+    revenue      = pick_col(fin, "Total Revenue", "Operating Revenue")
+    net_income   = pick_col(fin, "Net Income")
+    gross_profit = pick_col(fin, "Gross Profit")
 
-    equity       = series_or_none(bs, "Stockholders Equity") or series_or_none(bs, "Total Stockholder Equity")
-    total_assets = series_or_none(bs, "Total Assets")
-    curr_assets  = series_or_none(bs, "Total Current Assets")
-    curr_liab    = series_or_none(bs, "Total Current Liabilities")
+    # Balance sheet (use multiple common name variants)
+    equity = (
+        pick_col(bs,
+                 "Stockholders Equity",
+                 "Total Stockholder Equity",
+                 "Total Stockholders Equity",
+                 "Total Equity Gross Minority Interest")
+    )
+    total_assets = pick_col(bs, "Total Assets")
+    curr_assets  = pick_col(bs, "Total Current Assets")
+    curr_liab    = pick_col(bs, "Total Current Liabilities")
 
-    # Debt (prefer Total Debt; else Short LT + Long Term)
-    total_debt = series_or_none(bs, "Total Debt")
+    total_debt = pick_col(bs, "Total Debt", "Net Debt")
     if total_debt is None:
-        sld = series_or_none(bs, "Short Long Term Debt") or 0
-        ltd = series_or_none(bs, "Long Term Debt") or 0
-        if isinstance(sld, (int, float)): sld = pd.Series(0, index=bs.index)
-        if isinstance(ltd, (int, float)): ltd = pd.Series(0, index=bs.index)
-        total_debt = (sld.fillna(0) + ltd.fillna(0)) if not bs.empty else None
+        short_debt = pick_col(bs, "Short Long Term Debt", "Short Term Debt")
+        long_debt  = pick_col(bs, "Long Term Debt")
+        if short_debt is not None or long_debt is not None:
+            short_debt = short_debt.fillna(0) if short_debt is not None else 0
+            long_debt  = long_debt.fillna(0)  if long_debt  is not None else 0
+            total_debt = short_debt + long_debt
 
-    op_cf  = series_or_none(cf, "Operating Cash Flow")
-    capex  = series_or_none(cf, "Capital Expenditure")
-    fcf    = None
+    # Cash flow
+    op_cf = pick_col(cf, "Operating Cash Flow", "Total Cash From Operating Activities")
+    capex = pick_col(cf, "Capital Expenditure", "Capital Expenditures")
+    fcf   = None
     if op_cf is not None and capex is not None:
-        fcf = op_cf.fillna(0) + capex.fillna(0)  # CapEx is typically negative in yfinance
+        # CapEx is negative in yfinance; FCF = CFO - CapEx = CFO + (negative CapEx)
+        fcf = op_cf + capex
 
-    # Averages for ROE/ROA
-    equity_avg = avg_of_series(equity, 2) if equity is not None else None
-    assets_avg = avg_of_series(total_assets, 2) if total_assets is not None else None
+    # Averages for ROE/ROA (2-period rolling mean)
+    equity_avg = equity.rolling(2).mean() if equity is not None else None
+    assets_avg = total_assets.rolling(2).mean() if total_assets is not None else None
 
-    # Ratios (% where appropriate)
-    roe = (net_income / equity_avg * 100) if (net_income is not None and equity_avg is not None) else None
-    current_ratio = (curr_assets / curr_liab) if (curr_assets is not None and curr_liab is not None) else None
-    net_margin = (net_income / revenue * 100) if (net_income is not None and revenue is not None) else None
-    roa = (net_income / assets_avg * 100) if (net_income is not None and assets_avg is not None) else None
-    de_ratio = (total_debt / equity) if (total_debt is not None and equity is not None) else None
-    fcf_margin = (fcf / revenue * 100) if (fcf is not None and revenue is not None) else None
-    gross_margin = (gross_profit / revenue * 100) if (gross_profit is not None and revenue is not None) else None
+    # Ratios
+    roe          = safe_ratio(net_income, equity_avg, pct=True)     # %
+    current_ratio= safe_ratio(curr_assets, curr_liab, pct=False)    # x
+    net_margin   = safe_ratio(net_income, revenue, pct=True)        # %
+    roa          = safe_ratio(net_income, assets_avg, pct=True)     # %
+    de_ratio     = safe_ratio(total_debt, equity, pct=False)        # x
+    fcf_margin   = safe_ratio(fcf, revenue, pct=True)               # %
+    gross_margin = safe_ratio(gross_profit, revenue, pct=True)      # %
 
-    # Keep only last ~20 quarters to avoid clutter
-    def trim(s):
+    def trim(s):  # last ~20 quarters
         return s.tail(20) if s is not None else None
 
     return {
@@ -162,6 +224,7 @@ def compute_fundamental_series(ticker: str):
         "fcf_margin": trim(fcf_margin),
         "gross_margin": trim(gross_margin),
     }
+
 
 # -------------------- Sidebar --------------------
 st.sidebar.subheader("Ticker")
